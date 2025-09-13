@@ -1,26 +1,44 @@
 package main
 
 import (
-	"crypto/tls"
 	"flag"
-	"fmt"
-	"html"
 	"log"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"tailscale.com/tsnet"
 )
 
 var (
-	addr = flag.String("addr", ":80", "address to listen on")
+	dir = flag.String("dir", ".", "directory to serve")
 )
+
+func isBinaryFile(path string) bool {
+	ext := filepath.Ext(path)
+
+	switch mimeType := mime.TypeByExtension(ext); mimeType {
+	case "image/gif", "image/jpeg", "image/png", "image/webp", "video/mp4", "video/x-m4v":
+		return true
+	default:
+		return false
+	}
+}
 
 func main() {
 	flag.Parse()
+
+	info, err := os.Stat(*dir)
+	if err != nil || !info.IsDir() {
+		log.Fatalf("Invalid directory: %s", *dir)
+	}
+
 	srv := new(tsnet.Server)
 	defer srv.Close()
-	ln, err := srv.Listen("tcp", *addr)
+
+	ln, err := srv.Listen("tcp", ":80")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,24 +49,38 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if *addr == ":443" {
-		ln = tls.NewListener(ln, &tls.Config{
-			GetCertificate: lc.GetCertificate,
-		})
-	}
-
-	log.Fatal(http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fs := http.FileServer(http.Dir(*dir))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		who, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, "<html><body><h1>Hello, world!</h1>\n")
-		fmt.Fprintf(w, "<p>You are <b>%s</b> from <b>%s</b> (%s)</p>",
-			html.EscapeString(who.UserProfile.LoginName),
-			html.EscapeString(firstLabel(who.Node.ComputedName)),
-			r.RemoteAddr)
-	})))
+
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			log.Printf("user=%s, node=%s, path=%s, range=%s",
+				who.UserProfile.LoginName,
+				firstLabel(who.Node.ComputedName),
+				r.URL,
+				rangeHeader)
+		} else {
+			log.Printf("user=%s, node=%s, path=%s",
+				who.UserProfile.LoginName,
+				firstLabel(who.Node.ComputedName),
+				r.URL)
+		}
+
+		// Binary files like images and videos can be cached for a year,
+		// because they basically never change.
+		if isBinaryFile(r.URL.Path) {
+			w.Header().Set("Cache-Control", "public, max-age=31536000")
+		}
+
+		fs.ServeHTTP(w, r)
+	})
+
+	log.Printf("Serving directory %q over tsnet", *dir)
+	log.Fatal(http.Serve(ln, handler))
 }
 
 func firstLabel(s string) string {
